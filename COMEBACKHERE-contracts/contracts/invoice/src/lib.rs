@@ -3,15 +3,25 @@
 mod events;
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, IntoVal, String, Symbol,
-    Vec,
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, IntoVal, String,
+    Symbol, Vec,
 };
 
 /// Maximum length, in bytes, allowed for the optional `reference` field on an invoice.
 const MAX_REFERENCE_LEN: u32 = 64;
 
+/// Maximum number of invoice IDs accepted by a single batch operation.
+const MAX_BATCH_SIZE: u32 = 50;
+
 /// Minimum invoice amount, in stroops (10,000,000 stroops == 1 USDC given 7 decimals).
 const MIN_AMOUNT_USDC: i128 = 10_000_000;
+
+// At five seconds per ledger, these keep state alive for roughly 335 days before
+// renewal and extend it to roughly 359 days after an access or mutation.
+const INSTANCE_TTL_THRESHOLD: u32 = 5_800_000;
+const INSTANCE_TTL_EXTEND_TO: u32 = 6_200_000;
+const INVOICE_TTL_THRESHOLD: u32 = 5_800_000;
+const INVOICE_TTL_EXTEND_TO: u32 = 6_200_000;
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -38,6 +48,8 @@ pub enum ContractError {
     /// (e.g. `mark_paids` called on an invoice that is `RefundRequested`,
     /// `Released`, `Cancelled`, or `Expired`).
     InvalidStateTransition = 18,
+    /// A batch operation was called with more than `MAX_BATCH_SIZE` invoice IDs.
+    BatchTooLarge = 19,
 }
 
 #[contracttype]
@@ -94,8 +106,30 @@ fn check_not_paused(env: &Env) -> Result<(), ContractError> {
     if is_paused(env) {
         Err(ContractError::ContractPaused)
     } else {
+        extend_instance_ttl(env);
         Ok(())
     }
+}
+
+fn extend_instance_ttl(env: &Env) {
+    env.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
+}
+
+fn extend_invoice_ttl(env: &Env, invoice_id: u64) {
+    env.storage().persistent().extend_ttl(
+        &DataKey::Invoice(invoice_id),
+        INVOICE_TTL_THRESHOLD,
+        INVOICE_TTL_EXTEND_TO,
+    );
+}
+
+fn store_invoice(env: &Env, invoice_id: u64, invoice: &Invoice) {
+    env.storage()
+        .persistent()
+        .set(&DataKey::Invoice(invoice_id), invoice);
+    extend_invoice_ttl(env, invoice_id);
 }
 
 fn check_admin(env: &Env, addr: &Address) -> Result<(), ContractError> {
@@ -116,6 +150,17 @@ pub struct InvoiceContract;
 
 #[contractimpl]
 impl InvoiceContract {
+    /// Replaces this contract's Wasm while preserving its address and storage.
+    /// The stored admin must authorize the call.
+    pub fn upgrade(env: Env, new_wasm_hash: BytesN<32>) -> Result<(), ContractError> {
+        let contract_admin = admin(&env);
+        contract_admin.require_auth();
+        env.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        events::upgraded(&env, new_wasm_hash);
+        Ok(())
+    }
+
     /// Initialises the contract, setting the admin address and default configuration.
     ///
     /// # Parameters
@@ -139,6 +184,7 @@ impl InvoiceContract {
             .persistent()
             .set(&DataKey::InvoiceCount, &0u64);
         env.storage().persistent().set(&DataKey::Paused, &false);
+        extend_instance_ttl(&env);
         Ok(())
     }
 
@@ -222,9 +268,7 @@ impl InvoiceContract {
             expires_at,
             reference,
         };
-        env.storage()
-            .persistent()
-            .set(&DataKey::Invoice(count), &invoice);
+        store_invoice(&env, count, &invoice);
 
         events::invoice_created(&env, &merchant, &count);
         Ok(count)
@@ -238,10 +282,13 @@ impl InvoiceContract {
     /// # Errors
     /// - [`ContractError::InvoiceNotFound`] if no invoice with that ID exists.
     pub fn get_invoice(env: Env, invoice_id: u64) -> Result<Invoice, ContractError> {
-        env.storage()
+        let invoice = env
+            .storage()
             .persistent()
             .get(&DataKey::Invoice(invoice_id))
-            .ok_or(ContractError::InvoiceNotFound)
+            .ok_or(ContractError::InvoiceNotFound)?;
+        extend_invoice_ttl(&env, invoice_id);
+        Ok(invoice)
     }
 
     /// Returns only the [`InvoiceStatus`] for a given invoice ID, without fetching
@@ -258,7 +305,18 @@ impl InvoiceContract {
             .persistent()
             .get::<DataKey, Invoice>(&DataKey::Invoice(invoice_id))
             .ok_or(ContractError::InvoiceNotFound)?;
+        extend_invoice_ttl(&env, invoice_id);
         Ok(invoice.status)
+    }
+
+    /// Returns the number of invoices ever created, including cancelled and expired invoices.
+    ///
+    /// This is a read-only view of the counter used to allocate invoice IDs.
+    pub fn get_invoice_count(env: Env) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::InvoiceCount)
+            .unwrap_or(0)
     }
 
     /// Returns a paginated list of invoice IDs belonging to a given merchant, most useful
@@ -335,6 +393,7 @@ impl InvoiceContract {
     /// # Errors
     /// - [`ContractError::ContractPaused`] if the contract is currently paused.
     /// - [`ContractError::InvoiceNotFound`] if any ID in the batch does not exist.
+    /// - [`ContractError::BatchTooLarge`] if `invoice_ids` has more than `MAX_BATCH_SIZE` IDs.
     /// - [`ContractError::InvalidStateTransition`] if any invoice is `RefundRequested`,
     ///   `Released`, `Cancelled`, or `Expired` — a payment confirmation must never
     ///   silently override a refund already in progress or a closed invoice.
@@ -345,6 +404,9 @@ impl InvoiceContract {
     /// Emits `invoice_paid(invoice_id)` for each successfully marked invoice.
     pub fn mark_paids(env: Env, invoice_ids: Vec<u64>) -> Result<(), ContractError> {
         check_not_paused(&env)?;
+        if invoice_ids.len() > MAX_BATCH_SIZE {
+            return Err(ContractError::BatchTooLarge);
+        }
 
         // Resolve compliance contract once; if set, every invoice
         // customer must be allowed.
@@ -393,9 +455,7 @@ impl InvoiceContract {
             }
 
             invoice.status = InvoiceStatus::Paid;
-            env.storage()
-                .persistent()
-                .set(&DataKey::Invoice(id), &invoice);
+            store_invoice(&env, id, &invoice);
             events::invoice_paid(&env, &id);
         }
         Ok(())
@@ -431,9 +491,7 @@ impl InvoiceContract {
             // No funds have moved yet — simple cancellation.
             InvoiceStatus::Pending => {
                 invoice.status = InvoiceStatus::Cancelled;
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::Invoice(invoice_id), &invoice);
+                store_invoice(&env, invoice_id, &invoice);
                 events::invoice_cancelled(&env, &invoice_id);
                 Ok(())
             }
@@ -442,9 +500,7 @@ impl InvoiceContract {
             // complete the refund without leaving funds stuck.
             InvoiceStatus::Paid => {
                 invoice.status = InvoiceStatus::RefundRequested;
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::Invoice(invoice_id), &invoice);
+                store_invoice(&env, invoice_id, &invoice);
                 events::invoice_refund_req(&env, &invoice_id);
                 Ok(())
             }
@@ -497,9 +553,7 @@ impl InvoiceContract {
             return Err(ContractError::AlreadyRefundRequested);
         }
         invoice.status = InvoiceStatus::RefundRequested;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Invoice(invoice_id), &invoice);
+        store_invoice(&env, invoice_id, &invoice);
         events::invoice_refund_req(&env, &invoice_id);
         Ok(())
     }
@@ -555,9 +609,7 @@ impl InvoiceContract {
             return Err(ContractError::GraceWindowNotExpired);
         }
         invoice.status = InvoiceStatus::Released;
-        env.storage()
-            .persistent()
-            .set(&DataKey::Invoice(invoice_id), &invoice);
+        store_invoice(&env, invoice_id, &invoice);
         events::escrow_released(&env, &invoice_id);
         Ok(())
     }
@@ -573,11 +625,15 @@ impl InvoiceContract {
     /// # Errors
     /// - [`ContractError::ContractPaused`] if the contract is currently paused.
     /// - [`ContractError::InvoiceNotFound`] if any ID in the batch does not exist.
+    /// - [`ContractError::BatchTooLarge`] if `invoice_ids` has more than `MAX_BATCH_SIZE` IDs.
     ///
     /// # Events
     /// Emits `invoice_expired(invoice_id)` for each invoice that transitions to `Expired`.
     pub fn batch_expire(env: Env, invoice_ids: Vec<u64>) -> Result<(), ContractError> {
         check_not_paused(&env)?;
+        if invoice_ids.len() > MAX_BATCH_SIZE {
+            return Err(ContractError::BatchTooLarge);
+        }
         let now = env.ledger().timestamp();
         for id in invoice_ids.iter() {
             let mut invoice = env
@@ -587,9 +643,7 @@ impl InvoiceContract {
                 .ok_or(ContractError::InvoiceNotFound)?;
             if invoice.status == InvoiceStatus::Pending && now >= invoice.expires_at {
                 invoice.status = InvoiceStatus::Expired;
-                env.storage()
-                    .persistent()
-                    .set(&DataKey::Invoice(id), &invoice);
+                store_invoice(&env, id, &invoice);
                 events::invoice_expired(&env, &id);
             }
         }
@@ -698,6 +752,7 @@ impl InvoiceContract {
     pub fn pause(env: Env, caller: Address) -> Result<(), ContractError> {
         check_admin(&env, &caller)?;
         env.storage().persistent().set(&DataKey::Paused, &true);
+        extend_instance_ttl(&env);
         events::contract_paused(&env);
         Ok(())
     }
@@ -715,6 +770,7 @@ impl InvoiceContract {
     pub fn unpause(env: Env, caller: Address) -> Result<(), ContractError> {
         check_admin(&env, &caller)?;
         env.storage().persistent().set(&DataKey::Paused, &false);
+        extend_instance_ttl(&env);
         events::contract_unpaused(&env);
         Ok(())
     }
@@ -768,6 +824,21 @@ mod tests {
     }
 
     #[test]
+    fn test_get_invoice_count_tracks_created_invoices() {
+        let (env, cid, _admin) = setup_contract(1000);
+        let client = InvoiceContractClient::new(&env, &cid);
+        let merchant = Address::generate(&env);
+        let customer = Address::generate(&env);
+        let token = Address::generate(&env);
+
+        assert_eq!(client.get_invoice_count(), 0);
+        client.create_invoice(&merchant, &customer, &10_000_000i128, &token, &5000, &1, &None);
+        client.create_invoice(&merchant, &customer, &10_000_000i128, &token, &5000, &2, &None);
+
+        assert_eq!(client.get_invoice_count(), 2);
+    }
+
+    #[test]
     fn test_create_invoice_with_unique_nonce_succeeds() {
         let (env, cid, _admin) = setup_contract(1000);
         let client = InvoiceContractClient::new(&env, &cid);
@@ -776,6 +847,30 @@ mod tests {
         let token = Address::generate(&env);
         let invoice_id = client.create_invoice(&merchant, &customer, &10_000_000i128, &token, &5000, &1, &None);
         assert_eq!(invoice_id, 1);
+    }
+
+    #[test]
+    fn test_invoice_storage_remains_readable_after_many_ledgers() {
+        let (env, cid, _admin) = setup_contract(1000);
+        let client = InvoiceContractClient::new(&env, &cid);
+        let merchant = Address::generate(&env);
+        let customer = Address::generate(&env);
+        let token = Address::generate(&env);
+        let invoice_id = client.create_invoice(
+            &merchant,
+            &customer,
+            &10_000_000i128,
+            &token,
+            &5000,
+            &1,
+            &None,
+        );
+
+        env.ledger().with_mut(|li| {
+            li.sequence_number = INVOICE_TTL_EXTEND_TO - INVOICE_TTL_THRESHOLD + 1;
+        });
+        assert_eq!(client.get_invoice(&invoice_id).id, invoice_id);
+        assert_eq!(client.get_invoice_status(&invoice_id), InvoiceStatus::Pending);
     }
 
     #[test]

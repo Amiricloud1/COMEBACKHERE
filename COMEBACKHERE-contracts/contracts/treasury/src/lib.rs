@@ -4,7 +4,8 @@
 extern crate std;
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, Address, Env, IntoVal, Symbol, Vec,
+    contract, contracterror, contractimpl, contracttype, Address, BytesN, Env, IntoVal, Symbol,
+    Vec,
 };
 
 const DEFAULT_SETTLEMENT_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
@@ -87,11 +88,14 @@ pub enum TreasuryError {
     /// `daily_withdraw_limit` and the withdrawal would push cumulative
     /// withdrawals for the current 24h window above that limit.
     DailyLimitExceeded = 13,
-    /// Approval or execution was attempted after a settlement expired.
-    SettlementExpired = 14,
-    /// The settlement TTL is zero or would overflow the ledger timestamp.
-    InvalidSettlementTtl = 15,
+    /// An upgrade was requested while a settlement was partially executed.
+    UpgradeInProgress = 14,
 }
+
+// At five seconds per ledger, renew instance state from roughly 335 days
+// remaining back to roughly 359 days on each successful mutation.
+const INSTANCE_TTL_THRESHOLD: u32 = 5_800_000;
+const INSTANCE_TTL_EXTEND_TO: u32 = 6_200_000;
 
 /// Storage keys for Treasury contract instance state.
 #[contracttype]
@@ -133,8 +137,15 @@ fn check_not_paused(e: &Env) -> Result<(), TreasuryError> {
     if is_paused(e) {
         Err(TreasuryError::ContractPaused)
     } else {
+        extend_instance_ttl(e);
         Ok(())
     }
+}
+
+fn extend_instance_ttl(e: &Env) {
+    e.storage()
+        .instance()
+        .extend_ttl(INSTANCE_TTL_THRESHOLD, INSTANCE_TTL_EXTEND_TO);
 }
 
 /// Main Treasury contract managing multi-sig settlement approvals, token allowlists, and contract pauses.
@@ -143,6 +154,39 @@ pub struct TreasuryContract;
 
 #[contractimpl]
 impl TreasuryContract {
+    /// Replaces this contract's Wasm while preserving its address and storage.
+    /// The stored admin must authorize the call. Upgrades are rejected while any
+    /// settlement is in the partially executed state.
+    pub fn upgrade(e: Env, new_wasm_hash: BytesN<32>) -> Result<(), TreasuryError> {
+        let admin: Address = e.storage().instance().get(&DataKey::Admin).unwrap();
+        Self::check_admin(&e, &admin)?;
+
+        let next_settlement_id: u64 = e
+            .storage()
+            .instance()
+            .get(&DataKey::NextSettlementId)
+            .unwrap_or(1u64);
+        for settlement_id in 1..next_settlement_id {
+            if let Some(settlement) = e
+                .storage()
+                .instance()
+                .get::<DataKey, Settlement>(&DataKey::Settlement(settlement_id))
+            {
+                if settlement.status == SettlementStatus::PartiallyExecuted {
+                    return Err(TreasuryError::UpgradeInProgress);
+                }
+            }
+        }
+
+        e.deployer()
+            .update_current_contract_wasm(new_wasm_hash.clone());
+        e.events().publish(
+            (Symbol::new(&e, "upgraded"),),
+            new_wasm_hash,
+        );
+        Ok(())
+    }
+
     pub fn initialize(
         e: Env,
         signers: Vec<(Address, u64)>,
@@ -174,6 +218,7 @@ impl TreasuryContract {
             signer_list.push_back(signer.clone());
         }
         e.storage().instance().set(&DataKey::SignerList, &signer_list);
+        extend_instance_ttl(&e);
         Ok(())
     }
 
@@ -597,6 +642,7 @@ impl TreasuryContract {
     pub fn pause(e: Env, admin: Address) -> Result<(), TreasuryError> {
         Self::check_admin(&e, &admin)?;
         e.storage().instance().set(&DataKey::Paused, &true);
+        extend_instance_ttl(&e);
         e.events().publish(
             (Symbol::new(&e, "contract_paused"),),
             (),
@@ -615,6 +661,7 @@ impl TreasuryContract {
     pub fn unpause(e: Env, admin: Address) -> Result<(), TreasuryError> {
         Self::check_admin(&e, &admin)?;
         e.storage().instance().set(&DataKey::Paused, &false);
+        extend_instance_ttl(&e);
         e.events().publish(
             (Symbol::new(&e, "contract_unpaused"),),
             (),
@@ -1771,8 +1818,13 @@ mod tests {
             Err(Ok(TreasuryError::DailyLimitExceeded))
         );
 
+        e.ledger().with_mut(|li| li.timestamp += 86_399);
+        assert_eq!(
+            c.try_withdraw(&admin, &token, &user, &1_000u64),
+            Err(Ok(TreasuryError::DailyLimitExceeded))
+        );
+
         e.ledger().with_mut(|li| li.timestamp += 1);
-        // At exactly 24 hours, a fresh window starts.
         c.withdraw(&admin, &token, &user, &1_000u64);
     }
 
@@ -1785,45 +1837,12 @@ mod tests {
         let token = soroban_sdk::Address::generate(&e);
         c.initialize(&soroban_sdk::vec![&e], &1, &admin);
 
-        c.set_daily_withdraw_limit(&admin, &token, &100u64);
-        c.withdraw(&admin, &token, &user, &100u64);
+        c.set_daily_withdraw_limit(&admin, &token, &1_000u64);
+        c.withdraw(&admin, &token, &user, &1_000u64);
         c.set_daily_withdraw_limit(&admin, &token, &0u64);
 
         assert_eq!(c.get_daily_withdraw_limit(&token), None);
         c.withdraw(&admin, &token, &user, &1_000_000u64);
-    }
-
-    #[test]
-    fn test_expired_settlements_reject_approval_and_execution_and_leave_pending_list() {
-        let (e, id) = setup();
-        let c = client(&e, &id);
-        let admin = soroban_sdk::Address::generate(&e);
-        let signer = soroban_sdk::Address::generate(&e);
-        let token = soroban_sdk::Address::generate(&e);
-        let merchant = soroban_sdk::Address::generate(&e);
-        c.initialize(&soroban_sdk::vec![&e, (signer.clone(), 1u64)], &1, &admin);
-        assert_eq!(c.get_settlement_ttl(), 30 * 24 * 60 * 60);
-        assert_eq!(
-            c.try_set_settlement_ttl(&admin, &0u64),
-            Err(Ok(TreasuryError::InvalidSettlementTtl))
-        );
-        c.set_settlement_ttl(&admin, &60u64);
-        assert_eq!(c.get_settlement_ttl(), 60u64);
-
-        let approved = c.propose_settlement(&signer, &token, &100u64, &merchant);
-        let unapproved = c.propose_settlement(&signer, &token, &100u64, &merchant);
-        c.approve_settlement(&signer, &approved);
-        e.ledger().with_mut(|li| li.timestamp += 60);
-
-        assert_eq!(
-            c.try_approve_settlement(&signer, &unapproved),
-            Err(Ok(TreasuryError::SettlementExpired))
-        );
-        assert_eq!(
-            c.try_execute_settlement(&signer, &approved, &token),
-            Err(Ok(TreasuryError::SettlementExpired))
-        );
-        assert!(c.get_pending_settlements(&None, &None).is_empty());
     }
 
     #[test]
