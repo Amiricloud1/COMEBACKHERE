@@ -2,8 +2,10 @@
   "contract": "treasury",
   "version": "1.1.0",
   "functions": [
+    "upgrade",
     "initialize",
     "set_signer",
+    "rotate_signer",
     "propose_settlement",
     "cancel_settlement",
     "approve_settlement",
@@ -13,33 +15,22 @@
     "pause",
     "unpause",
     "get_threshold",
+    "get_settlement_ttl",
+    "set_settlement_ttl",
     "update_threshold",
+    "get_total_signer_weight",
     "raise_dispute",
     "resolve_dispute",
     "update_settlement_merchant",
     "get_settlement",
     "deposit",
+    "set_daily_withdraw_limit",
+    "get_daily_withdraw_limit",
     "withdraw",
     "add_token_to_allowlist",
-    "remove_token_from_allowlist"
+    "remove_token_from_allowlist",
+    "get_allowlisted_tokens"
   ],
-  "events": [
-    "settlement_cancelled"
-  ],
-  "errors": {
-    "1": "ContractPaused",
-    "2": "NotPending",
-    "3": "InsufficientApprovals",
-    "4": "TokenNotAllowed",
-    "5": "Unauthorized",
-    "6": "InvalidThreshold",
-    "7": "DuplicateSigner",
-    "8": "InvalidWeightSum",
-    "9": "NotSettlementParty",
-    "10": "ThresholdExceedsWeight",
-    "11": "InvalidPagination",
-    "12": "SignerNotFound",
-    "13": "DailyLimitExceeded",
-    "14": "SettlementNotFound"
-  }
+  "events": ["upgraded", "signer_rotated", "balance", "contract_paused", "contract_unpaused", "threshold_updated", "merchant_updated", "daily_withdraw_limit_set"],
+  "threshold": "2-of-3"
 }

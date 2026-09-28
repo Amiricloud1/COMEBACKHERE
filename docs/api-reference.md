@@ -33,6 +33,25 @@ gets a relaxed CSP that allows its same-origin scripts, inline styles and
 > `{ "error": { "code", "message", "details", "correlationId" } }`. See
 > [Error response shape](#error-response-shape).
 
+## Deprecation Policy
+
+Some endpoints are marked as **deprecated** and will be removed in a future version. Deprecated endpoints receive standard HTTP deprecation headers:
+
+- `Deprecation: true` — indicates the endpoint is deprecated
+- `Sunset: <HTTP-date>` — the date when the endpoint will be permanently removed
+- `Link: <new-url>; rel="successor-version"` — the replacement endpoint to migrate to
+
+**Legacy routes** in `backend/src/legacy_routes.rs` and `backend/src/routes_auth_legacy.rs` carry these headers. Plan to migrate to the canonical routes before the sunset date.
+
+Current legacy routes (to be removed):
+- Old merchant endpoints under `/api/v1/merchant/*` — migrate to `/api/v2/merchant/*`
+- Old settlement endpoints under `/api/v1/settlement/*` — migrate to `/api/v2/settlement/*`
+- Old dispute endpoints under `/api/v1/dispute/*` — migrate to `/api/v2/dispute/*`
+- Old signer endpoints under `/api/v1/signer/*` — migrate to `/api/v2/signer/*`
+- Old admin endpoints under `/api/v1/admin/*` — migrate to `/api/v2/admin/*`
+
+Usage of deprecated endpoints is logged server-side; if you hit one, update your client to use the replacement endpoint.
+
 ---
 
 ## Health
@@ -102,6 +121,79 @@ Fetch the on-chain status of an invoice by its numeric ID.
 | `404`  | Invoice not found on-chain               |
 | `503`  | Missing required environment variables   |
 | `500`  | Unexpected server error                  |
+
+---
+
+### `POST /invoices/:id/cancel`
+
+Cancel an invoice using the configured Soroban signer. Cancelling a `Pending`
+invoice changes it to `Cancelled`; cancelling a `Paid` invoice starts the
+refund flow and changes it to `RefundRequested`.
+
+**Response `200`**
+
+```json
+{ "invoice_id": "42", "status": "RefundRequested", "tx_hash": "..." }
+```
+
+| Status | Description                                      |
+| ------ | ------------------------------------------------ |
+| `400`  | Invalid invoice ID                               |
+| `403`  | Caller is not authorized to cancel the invoice   |
+| `404`  | Invoice not found                                |
+| `409`  | Invoice state does not allow cancellation        |
+| `503`  | Missing required environment variables           |
+
+### `POST /invoices/:id/refund`
+
+Request a refund for a `Paid` invoice using the configured Soroban signer.
+The response reports the updated `RefundRequested` status.
+
+**Response `200`**
+
+```json
+{ "invoice_id": "42", "status": "RefundRequested", "tx_hash": "..." }
+```
+
+| Status | Description                                          |
+| ------ | ---------------------------------------------------- |
+| `400`  | Invalid invoice ID                                   |
+| `403`  | Caller is not the invoice customer                  |
+| `404`  | Invoice not found                                    |
+| `409`  | Invoice is not `Paid` or a refund is already pending |
+| `503`  | Missing required environment variables               |
+
+---
+
+### `GET /invoices`
+
+Lists invoices, newest first. Cursor pagination is the default. Pass the
+returned `next_cursor` to fetch the next page; it is `null` when no more
+invoices are available.
+
+| Parameter | Type    | Description                                  |
+| --------- | ------- | -------------------------------------------- |
+| `cursor`  | string  | Opaque cursor from the previous response     |
+| `limit`   | integer | Page size, 1–100 (default 20)                |
+| `status`  | string  | Optional invoice status filter               |
+| `merchant` | string | Optional merchant address filter              |
+| `page`    | integer | Deprecated; use `cursor`, supported one release |
+| `offset`  | integer | Deprecated; use `cursor`, supported one release |
+
+**Cursor response `200`**
+
+```json
+{
+  "data": [],
+  "limit": 20,
+  "next_cursor": "eyJjcmVhdGVkQXQiOjE3MDAwMDAwMDAwMDAsImludm9pY2VJZCI6IjQyIn0"
+}
+```
+
+When `page` or `offset` is supplied without a cursor, the legacy response
+metadata (`total`, `page`, `limit`, `totalPages`, and `offset`) remains
+available during the deprecation period. Legacy parameters cannot be combined
+with a cursor.
 
 ---
 
@@ -837,6 +929,17 @@ function verifyWebhook(
 Always use a **constant-time comparison** (e.g. `crypto.timingSafeEqual`) when
 comparing signatures to prevent timing side-channel attacks.
 
+### Dead-letter operations
+
+Failed webhook deliveries are retained in MongoDB's `webhook_dead_letters`
+collection with the target URL, original payload, final error, and attempt
+history. These operator endpoints require `x-admin-key`:
+
+| Method and path | Description |
+| --------------- | ----------- |
+| `GET /webhooks/dead-letters` | List the latest 100 permanently failed deliveries |
+| `POST /webhooks/dead-letters/:id/replay` | Retry one delivery by its idempotency key; remove the dead letter only on success |
+
 ### Webhook event payload shape
 
 All events share a common `event` field plus event-specific fields:
@@ -864,6 +967,153 @@ All events share a common `event` field plus event-specific fields:
 
 Set both variables in your deployment environment. If `WEBHOOK_URL` is not set,
 webhook delivery is skipped silently (no error).
+
+---
+
+## Analytics
+
+### `GET /api/analytics/metrics`
+
+Fetch aggregated protocol metrics and performance data.
+
+**Query parameters** (all optional)
+
+| Parameter    | Type    | Description                                              |
+| ------------ | ------- | -------------------------------------------------------- |
+| `start_date` | string  | ISO-8601 date (e.g. `2025-03-01`) — default: 30 days ago |
+| `end_date`   | string  | ISO-8601 date (e.g. `2025-03-31`) — default: today       |
+| `resolution` | string  | Aggregation granularity: `daily`, `weekly`, `monthly` (default: `daily`) |
+
+**Response `200`**
+
+```json
+{
+  "period": {
+    "start": "2025-03-01T00:00:00Z",
+    "end": "2025-03-31T23:59:59Z"
+  },
+  "summary": {
+    "total_invoices": 156,
+    "total_revenue_usdc": "150000000000",
+    "avg_invoice_amount_usdc": "961538462",
+    "settlement_success_rate": 0.98
+  },
+  "by_date": [
+    {
+      "date": "2025-03-01",
+      "invoices_created": 5,
+      "invoices_paid": 4,
+      "revenue_usdc": "4800000000",
+      "disputes_raised": 0
+    }
+  ]
+}
+```
+
+| Field                      | Type   | Description                                      |
+| -------------------------- | ------ | ------------------------------------------------ |
+| `period`                   | object | Query date range (ISO-8601)                      |
+| `summary`                  | object | Aggregate metrics across the entire period       |
+| `by_date`                  | array  | Per-day breakdown (if resolution is `daily`)     |
+| `total_invoices`           | number | Count of all invoices in the period              |
+| `total_revenue_usdc`       | string | Sum of all paid invoice amounts (stroops)        |
+| `avg_invoice_amount_usdc`  | string | Mean invoice amount (stroops)                    |
+| `settlement_success_rate`  | number | Fraction of settlements executed successfully (0–1) |
+
+#### Errors
+
+| Status | Description                            |
+| ------ | -------------------------------------- |
+| `400`  | Invalid date format or date range      |
+| `503`  | Database connection error              |
+| `500`  | Unexpected server error                |
+
+---
+
+## Disputes
+
+### `GET /api/disputes/:settlementId`
+
+Fetch dispute status for a settlement.
+
+#### Path parameters
+
+| Parameter      | Type   | Description                   |
+| -------------- | ------ | ----------------------------- |
+| `settlementId` | string | Settlement numeric ID as string |
+
+**Response `200`**
+
+```json
+{
+  "settlement_id": 15,
+  "dispute_status": "Raised",
+  "claimant": "G...",
+  "reason": "Payment never received",
+  "created_at": "2025-03-15T10:30:00Z",
+  "resolution_weight": 0,
+  "threshold": 100
+}
+```
+
+| Field               | Type   | Description                                              |
+| ------------------- | ------ | -------------------------------------------------------- |
+| `settlement_id`     | number | Settlement ID                                            |
+| `dispute_status`    | string | One of: `Raised`, `ResolvedClaimant`, `ResolvedCounterparty`, `None` |
+| `claimant`          | string | Stellar address that raised the dispute                  |
+| `reason`            | string | Text reason provided by the claimant                     |
+| `created_at`        | string | ISO-8601 timestamp when dispute was raised               |
+| `resolution_weight` | number | Cumulative signer weight voting on the dispute           |
+| `threshold`         | number | Signer weight threshold required to resolve              |
+
+#### Errors
+
+| Status | Description                            |
+| ------ | -------------------------------------- |
+| `400`  | `settlementId` is not a positive integer |
+| `404`  | No dispute found for this settlement    |
+| `503`  | Missing required environment variables  |
+| `500`  | Unexpected server error                |
+
+### `POST /api/disputes/:settlementId/vote`
+
+Vote on a dispute resolution (admin/signer only).
+
+**Request body**
+
+```json
+{
+  "vote": "ClaimantWins",
+  "admin_key": "secret_key_123"
+}
+```
+
+| Field       | Type   | Description                                          |
+| ----------- | ------ | ---------------------------------------------------- |
+| `vote`      | string | Vote direction: `ClaimantWins` or `CounterpartyWins` |
+| `admin_key` | string | Admin secret key (if using key-based authorization) |
+
+**Response `200`**
+
+```json
+{
+  "settlement_id": 15,
+  "resolution_weight": 65,
+  "threshold": 100,
+  "outcome": "pending"
+}
+```
+
+#### Errors
+
+| Status | Description                                      |
+| ------ | ------------------------------------------------ |
+| `400`  | Invalid vote direction or settlement ID          |
+| `401`  | Missing or invalid `admin_key`                   |
+| `404`  | No dispute found                                 |
+| `409`  | Dispute already resolved or settlement not held  |
+| `503`  | Missing required environment variables or contract unavailable |
+| `500`  | Unexpected server error                          |
 
 ---
 
@@ -933,5 +1183,9 @@ handlers are wrapped in `asyncHandler` so rejected promises reach it.
 | `NETWORK_PASSPHRASE`   | Stellar network passphrase                                |
 | `WEBHOOK_URL`          | Merchant webhook endpoint URL                             |
 | `WEBHOOK_SIGNING_SECRET` | HMAC-SHA256 signing secret for outbound webhooks        |
+| `WEBHOOK_MAX_ATTEMPTS` | Maximum webhook attempts (default `5`)                     |
+| `WEBHOOK_BASE_DELAY_MS` | Initial retry delay in ms (default `1000`)                 |
+| `WEBHOOK_MAX_DELAY_MS` | Maximum backoff delay in ms (default `60000`)               |
+| `WEBHOOK_JITTER_RATIO` | Retry jitter from `0` to `1` (default `0.2`)                |
 | `PORT`                 | HTTP server port (default `3000`)                         |
 | `CORS_ORIGINS`         | Comma-separated allowlist of browser origins, e.g. `http://localhost:5173,https://app.example.com`. Bare origins only (no path, trailing slash or `*`); invalid entries fail startup. Unset = no cross-origin access. |

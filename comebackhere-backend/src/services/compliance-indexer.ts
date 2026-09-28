@@ -1,4 +1,4 @@
-import { xdr } from "stellar-sdk"
+import { SorobanRpc, xdr } from "stellar-sdk"
 import { buildSorobanClient, type SorobanClient } from "../lib/soroban.js"
 import { connectMongo, getCursorsCollection, getComplianceAuditCollection, type ComplianceAuditRecord, type ComplianceAuditStatus } from "../db/mongo.js"
 
@@ -6,6 +6,7 @@ const CURSOR_ID = "compliance_audit_events"
 const EVENT_LIMIT = 100
 const POLL_INTERVAL_MS = 5_000
 const EVENT_TYPES = new Set(["address_allowed", "address_allowed_until", "address_blocked", "address_cleared"])
+type ComplianceRpcEvent = Awaited<ReturnType<SorobanRpc.Server["getEvents"]>>["events"][number]
 
 function symbol(topic: xdr.ScVal[] | undefined, index: number): string {
   return topic?.[index]?.sym()?.toString() ?? ""
@@ -15,48 +16,18 @@ function address(value: xdr.ScVal | undefined): string {
   return value?.address()?.toString() ?? ""
 }
 
-function status(value: xdr.ScVal | undefined): string {
-  try { return value?.sym()?.toString() ?? "" }
-  catch { return "" }
+function eventAddress(event: ComplianceRpcEvent, eventType: string): string {
+  return address(eventType === "address_cleared" || eventType === "address_allowed_until"
+    ? event.value?.vec()?.[0]
+    : event.value)
 }
 
-function values(event: any): xdr.ScVal[] | undefined {
-  try { return event.value?.vec() }
-  catch { return undefined }
+function eventExpiry(event: ComplianceRpcEvent, eventType: string): number | null {
+  if (eventType !== "address_allowed_until") return null
+  return Number(event.value?.vec()?.[1]?.u64()?.toString() ?? 0) || null
 }
 
-function isU64(value: xdr.ScVal | undefined): boolean {
-  try { return value?.u64() !== undefined }
-  catch { return false }
-}
-
-function eventAddress(event: any, eventType: string): string {
-  const payload = values(event)
-  return address(payload?.[0] ?? event.value)
-}
-
-function eventStatus(event: any, eventType: string): ComplianceAuditStatus {
-  const payload = values(event)
-  const emittedStatus = status(payload?.[1])
-  if (emittedStatus === "Allowed" || emittedStatus === "AllowedUntil" || emittedStatus === "Blocked" || emittedStatus === "Cleared") {
-    return emittedStatus
-  }
-  if (isU64(payload?.[1])) return "AllowedUntil"
-  if (eventType === "address_allowed_until") return "AllowedUntil"
-  if (eventType === "address_blocked") return "Blocked"
-  if (eventType === "address_cleared") return "Cleared"
-  return "Allowed"
-}
-
-function eventExpiry(event: any, eventType: string): number | null {
-  const payload = values(event)
-  const expiry = status(payload?.[1]) ? payload?.[2] : payload?.[1]
-  if (eventType !== "address_allowed_until" && !isU64(expiry)) return null
-  if (!isU64(expiry)) return null
-  return Number(expiry?.u64().toString()) || null
-}
-
-export function complianceEventId(event: any, eventType: string, addressValue: string): string {
+export function complianceEventId(event: ComplianceRpcEvent, eventType: string, addressValue: string): string {
   return event.pagingToken ?? `${event.txHash ?? ""}:${eventType}:${addressValue}`
 }
 
@@ -116,7 +87,7 @@ export async function processComplianceIndexerBatch(
     {
       $set: { paging_token: lastToken, last_ledger: response.latestLedger ?? cursor.last_ledger, updated_at: new Date() },
       ...(newIds.length ? { $push: { processed_event_ids: { $each: newIds, $slice: -1000 } } } : {}),
-    } as any,
+    },
     { upsert: true },
   )
   return processed
