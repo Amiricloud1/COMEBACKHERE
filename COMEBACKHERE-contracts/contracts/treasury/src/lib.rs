@@ -8,6 +8,8 @@ use soroban_sdk::{
     Vec,
 };
 
+const DEFAULT_SETTLEMENT_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
+
 /// Status of a settlement proposal within the Treasury contract.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -39,6 +41,8 @@ pub struct Settlement {
     pub approval_weight: u64,
     /// Address of the signer who proposed the settlement.
     pub proposer: Address,
+    /// Ledger timestamp at which this proposal expires.
+    pub expires_at: u64,
 }
 
 /// Tracks cumulative withdrawals of one token within the current rolling
@@ -118,6 +122,8 @@ pub enum DataKey {
     DailyWithdrawLimit(Address),
     /// Per-token rolling-window withdrawal ledger; value is a [`WithdrawWindow`].
     WithdrawWindow(Address),
+    /// Admin-configured settlement proposal lifetime in seconds.
+    SettlementTtl,
 }
 
 fn is_paused(e: &Env) -> bool {
@@ -380,6 +386,11 @@ impl TreasuryContract {
             .instance()
             .get(&DataKey::NextSettlementId)
             .unwrap_or(1u64);
+        let expires_at = e
+            .ledger()
+            .timestamp()
+            .checked_add(Self::get_settlement_ttl(e.clone()))
+            .ok_or(TreasuryError::InvalidSettlementTtl)?;
 
         let settlement = Settlement {
             token,
@@ -388,6 +399,7 @@ impl TreasuryContract {
             status: SettlementStatus::Pending,
             approval_weight: 0u64,
             proposer: signer,
+            expires_at,
         };
 
         e.storage()
@@ -420,6 +432,9 @@ impl TreasuryContract {
         let mut settlement = Self::get_settlement_internal(&e, settlement_id);
         if settlement.status != SettlementStatus::Pending {
             return Err(TreasuryError::NotPending);
+        }
+        if e.ledger().timestamp() >= settlement.expires_at {
+            return Err(TreasuryError::SettlementExpired);
         }
         let weight: u64 = e
             .storage()
@@ -456,6 +471,9 @@ impl TreasuryContract {
         let mut settlement = Self::get_settlement_internal(&e, settlement_id);
         if settlement.status != SettlementStatus::Pending {
             return Err(TreasuryError::NotPending);
+        }
+        if e.ledger().timestamp() >= settlement.expires_at {
+            return Err(TreasuryError::SettlementExpired);
         }
         let threshold: u64 = e
             .storage()
@@ -512,6 +530,7 @@ impl TreasuryContract {
 
         let would_succeed = !is_paused(&e)
             && settlement.status == SettlementStatus::Pending
+            && e.ledger().timestamp() < settlement.expires_at
             && quorum_reached
             && sufficient_balance;
 
@@ -567,7 +586,9 @@ impl TreasuryContract {
                 .instance()
                 .get::<DataKey, Settlement>(&DataKey::Settlement(id))
             {
-                if matches!(s.status, SettlementStatus::Pending) {
+                if matches!(s.status, SettlementStatus::Pending)
+                    && e.ledger().timestamp() < s.expires_at
+                {
                     if matched >= skip {
                         if collected >= cap {
                             break;
@@ -662,6 +683,31 @@ impl TreasuryContract {
             .unwrap_or(0u64)
     }
 
+    /// Returns the configured settlement TTL, or the 30-day default.
+    pub fn get_settlement_ttl(e: Env) -> u64 {
+        e.storage()
+            .instance()
+            .get(&DataKey::SettlementTtl)
+            .unwrap_or(DEFAULT_SETTLEMENT_TTL_SECONDS)
+    }
+
+    /// Sets the lifetime, in seconds, of newly proposed settlements.
+    pub fn set_settlement_ttl(
+        e: Env,
+        admin: Address,
+        ttl_seconds: u64,
+    ) -> Result<(), TreasuryError> {
+        check_not_paused(&e)?;
+        Self::check_admin(&e, &admin)?;
+        if ttl_seconds == 0 {
+            return Err(TreasuryError::InvalidSettlementTtl);
+        }
+        e.storage()
+            .instance()
+            .set(&DataKey::SettlementTtl, &ttl_seconds);
+        Ok(())
+    }
+
     /// Updates the required approval threshold weight for settlement execution.
     ///
     /// # Arguments
@@ -707,6 +753,27 @@ impl TreasuryContract {
     /// never drift out of sync with the individual `Signer(address)` entries.
     pub fn get_total_signer_weight(e: Env) -> u64 {
         Self::total_signer_weight(&e)
+    }
+
+    /// Returns current signers and weights in stable registration order.
+    pub fn get_signers(e: Env) -> Vec<(Address, u64)> {
+        let signer_list: Vec<Address> = e
+            .storage()
+            .instance()
+            .get(&DataKey::SignerList)
+            .unwrap_or_else(|| Vec::new(&e));
+        let mut signers = Vec::new(&e);
+        for signer in signer_list.iter() {
+            let weight: u64 = e
+                .storage()
+                .instance()
+                .get(&DataKey::Signer(signer.clone()))
+                .unwrap_or(0u64);
+            if weight > 0 {
+                signers.push_back((signer, weight));
+            }
+        }
+        signers
     }
 
     fn total_signer_weight(e: &Env) -> u64 {
@@ -880,8 +947,7 @@ impl TreasuryContract {
     }
 
     /// Returns the configured daily withdrawal cap for a token, or `None` if
-    /// the admin has never set one (in which case withdrawals of that token
-    /// are unrestricted).
+    /// the admin has never set one or cleared it with a zero limit.
     pub fn get_daily_withdraw_limit(e: Env, token: Address) -> Option<u64> {
         e.storage()
             .instance()
@@ -1024,6 +1090,14 @@ impl TreasuryContract {
             .instance()
             .set(&DataKey::TokenAllowlist, &updated);
         Ok(())
+    }
+
+    /// Returns allowlisted tokens in stable insertion order.
+    pub fn get_allowlisted_tokens(e: Env) -> Vec<Address> {
+        e.storage()
+            .instance()
+            .get(&DataKey::TokenAllowlist)
+            .unwrap_or_else(|| Vec::new(&e))
     }
 
     fn get_settlement_internal(e: &Env, settlement_id: u64) -> Settlement {
@@ -1455,6 +1529,35 @@ mod tests {
     }
 
     #[test]
+    fn test_allowlisted_tokens_preserve_order_across_remove_and_readd() {
+        let (e, id) = setup();
+        let c = client(&e, &id);
+        let admin = soroban_sdk::Address::generate(&e);
+        let token1 = soroban_sdk::Address::generate(&e);
+        let token2 = soroban_sdk::Address::generate(&e);
+        c.initialize(&soroban_sdk::vec![&e], &1, &admin);
+
+        assert!(c.get_allowlisted_tokens().is_empty());
+        c.add_token_to_allowlist(&admin, &token1);
+        c.add_token_to_allowlist(&admin, &token2);
+        c.add_token_to_allowlist(&admin, &token1);
+        assert_eq!(
+            c.get_allowlisted_tokens(),
+            soroban_sdk::vec![&e, token1.clone(), token2.clone()]
+        );
+
+        c.remove_token_from_allowlist(&admin, &token1);
+        c.add_token_to_allowlist(&admin, &token1);
+        assert_eq!(
+            c.get_allowlisted_tokens(),
+            soroban_sdk::vec![&e, token2.clone(), token1.clone()]
+        );
+        c.remove_token_from_allowlist(&admin, &token2);
+        c.remove_token_from_allowlist(&admin, &token1);
+        assert!(c.get_allowlisted_tokens().is_empty());
+    }
+
+    #[test]
     fn test_token_allowlist_checked_before_paused() {
         let (e, id) = setup();
         let c = client(&e, &id);
@@ -1535,6 +1638,48 @@ mod tests {
         // The old signer address must no longer carry any weight.
         let res = c.try_rotate_signer(&admin, &s1, &new_s1, &1u64);
         assert_eq!(res, Err(Ok(TreasuryError::SignerNotFound)));
+    }
+
+    #[test]
+    fn test_get_signers_tracks_live_weights_in_stable_order() {
+        let (e, id) = setup();
+        let c = client(&e, &id);
+        let admin = soroban_sdk::Address::generate(&e);
+        let s1 = soroban_sdk::Address::generate(&e);
+        let s2 = soroban_sdk::Address::generate(&e);
+        let s3 = soroban_sdk::Address::generate(&e);
+        let s4 = soroban_sdk::Address::generate(&e);
+        c.initialize(
+            &soroban_sdk::vec![&e, (s1.clone(), 1u64), (s2.clone(), 2u64)],
+            &1,
+            &admin,
+        );
+
+        let initial_signers = c.get_signers();
+        assert_eq!(
+            initial_signers,
+            soroban_sdk::vec![&e, (s1.clone(), 1u64), (s2.clone(), 2u64)]
+        );
+        let listed_weight: u64 = initial_signers.iter().map(|(_, weight)| weight).sum();
+        assert_eq!(listed_weight, c.get_total_signer_weight());
+
+        c.set_signer(&admin, &s1, &0u64);
+        let listed_weight: u64 = c.get_signers().iter().map(|(_, weight)| weight).sum();
+        assert_eq!(listed_weight, c.get_total_signer_weight());
+
+        c.set_signer(&admin, &s3, &3u64);
+        let listed_weight: u64 = c.get_signers().iter().map(|(_, weight)| weight).sum();
+        assert_eq!(listed_weight, c.get_total_signer_weight());
+
+        c.rotate_signer(&admin, &s2, &s4, &4u64);
+
+        let signers = c.get_signers();
+        assert_eq!(
+            signers,
+            soroban_sdk::vec![&e, (s3, 3u64), (s4, 4u64)]
+        );
+        let listed_weight: u64 = signers.iter().map(|(_, weight)| weight).sum();
+        assert_eq!(listed_weight, c.get_total_signer_weight());
     }
 
     /// Rotating a signer to a LOWER weight updates total_signer_weight, but
@@ -1667,6 +1812,7 @@ mod tests {
 
         c.set_daily_withdraw_limit(&admin, &token, &1_000u64);
         c.withdraw(&admin, &token, &user, &1_000u64);
+        e.ledger().with_mut(|li| li.timestamp += 86_399);
         assert_eq!(
             c.try_withdraw(&admin, &token, &user, &1u64),
             Err(Ok(TreasuryError::DailyLimitExceeded))

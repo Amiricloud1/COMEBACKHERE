@@ -14,6 +14,8 @@
     "pause",
     "unpause",
     "get_threshold",
+    "get_settlement_ttl",
+    "set_settlement_ttl",
     "update_threshold",
     "get_total_signer_weight",
     "raise_dispute",
@@ -25,7 +27,8 @@
     "get_daily_withdraw_limit",
     "withdraw",
     "add_token_to_allowlist",
-    "remove_token_from_allowlist"
+    "remove_token_from_allowlist",
+    "get_allowlisted_tokens"
   ],
   "events": ["upgraded", "signer_rotated", "balance", "contract_paused", "contract_unpaused", "threshold_updated", "merchant_updated", "daily_withdraw_limit_set"],
   "threshold": "2-of-3"
